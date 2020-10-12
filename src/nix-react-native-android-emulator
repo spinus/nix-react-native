@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export SHELLOPTS
+
+# based on nixpkgs/pkgs/development/mobile/androidenv/emulate-app.nix (from nixpkgs-20.03)
+
+echo "==== Starting nix-react-native-android-emulator ===="
+
+export NIX_ANDROID_EMULATOR_DEVICE_NAME=device-1
+export NIX_ANDROID_EMULATOR_PORT=random
+export NIX_ANDROID_AVD_ARGS=
+export NIX_ANDROID_EMULATOR_ARGS=
+export NIX_ANDROID_EMULATOR_PLATFORM_VERSION=${NIX_ANDROID_EMULATOR_PLATFORM_VERSION?Please provide this variable}
+export NIX_ANDROID_EMULATOR_SYSTEM_IMAGE_TYPE=${NIX_ANDROID_EMULATOR_SYSTEM_IMAGE_TYPE?Please provide this variable}
+export NIX_ANDROID_EMULATOR_ABI_VERSION=${NIX_ANDROID_EMULATOR_ABI_VERSION?Please provide this variable}
+export JAVA_OPTS=${JAVA_OPTS:=}
+
+while [[ $# -gt 0 ]];do
+  case "$1" in
+    -h|--help|help)
+      echo "Usage ''${BASH_SOURCE##/*} [options]"
+      echo
+      echo "You must set at least --emulator-args @DEVICE-NAME for emulator to start (you can use '@device')"
+      echo
+      echo Compiled with:
+      echo "   Platform: ${NIX_ANDROID_EMULATOR_PLATFORM_VERSION}"
+      echo "   System Type: ${NIX_ANDROID_EMULATOR_SYSTEM_IMAGE_TYPE}"
+      echo "   Abi:  ${NIX_ANDROID_EMULATOR_ABI_VERSION}"
+      echo
+      echo "[options]"
+      echo "  --device <NAME>     - passed to AVD as '-n NAME' and to emulator as '@NAME' (default: @NIX_ANDROID_EMULATOR_DEVICE_NAME)"
+      echo "  --port <int>        - run emulator ADB on port. If not specified, use random port."
+      echo "  --emulator-args <X> - pass args to android emulator (even --help)"
+      echo "  --avd-args <X>      - pass args to avd creation command (even --help)"
+      echo
+      echo "Shortcuts"
+      echo "  --headless       - adds '-no-window' to emulator args (run without window, good for automated tests)"
+      echo "  --gpu            - adds '-gpu swiftshader_indirect' to emulator args"
+      ;;
+    --avd-args)
+      shift
+      export NIX_ANDROID_AVD_ARGS="$NIX_ANDROID_AVD_ARGS $1"
+      ;;
+    --device)
+      shift
+      export NIX_ANDROID_EMULATOR_DEVICE_NAME="$1"
+      ;;
+    --emulator-args)
+      shift
+      export NIX_ANDROID_EMULATOR_ARGS="$NIX_ANDROID_EMULATOR_ARGS $1"
+      ;;
+    --headless)
+      export NIX_ANDROID_EMULATOR_ARGS="$NIX_ANDROID_EMULATOR_ARGS -no-window"
+      ;;
+    --port)
+      shift
+      if [[ ${1?--port requires argument} -gt 60000 ]] || [[ $1 -lt 1024 ]];then
+        echo "ERROR: port must be > 1024 and < 60000"
+        exit 1
+      fi
+      export NIX_ANDROID_EMULATOR_PORT=$1
+      ;;
+    *)
+      echo "ERROR: unknown argument $1"
+      exit 18
+      ;;
+  esac
+  shift
+done
+
+echo "  Configuration:  "
+export DISPLAY
+echo "    DISPLAY=${DISPLAY:-<< not set >>}"
+export ANDROID_SDK_HOME=${EMULATOR_STATE_PATH?Set this variable to path that can be safely deleted}
+echo "    EMULATOR_STATE_PATH=$EMULATOR_STATE_PATH"
+echo "    ANDROID_SDK_HOME=$ANDROID_SDK_HOME"
+echo "    ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT? This variable must be set to android SDK path (with emulator inside)}"
+echo "    NIX_ANDROID_EMULATOR_ARGS=$NIX_ANDROID_EMULATOR_ARGS"
+echo "    NIX_ANDROID_AVD_ARGS=$NIX_ANDROID_AVD_ARGS"
+echo "    NIX_ANDROID_EMULATOR_PLATFORM_VERSION=${NIX_ANDROID_EMULATOR_PLATFORM_VERSION?Please provide this variable}"
+echo "    NIX_ANDROID_EMULATOR_SYSTEM_IMAGE_TYPE=${NIX_ANDROID_EMULATOR_SYSTEM_IMAGE_TYPE?Please provide this variable}"
+echo "    NIX_ANDROID_EMULATOR_ABI_VERSION=${NIX_ANDROID_EMULATOR_ABI_VERSION?Please provide this variable}"
+export adb="$ANDROID_SDK_ROOT/platform-tools/adb"
+echo "    adb=$adb"
+
+if [[ ! -f "${ANDROID_SDK_ROOT}/emulator/emulator" ]];then
+  echo "ERROR: android sdk was built without emulator. Please provide SDK with emulator inside"
+  echo "ERROR: Probably you want to rebuild nix-react-native with android SDK with emulator support"
+  exit 1
+fi
+
+
+if [[ $NIX_ANDROID_EMULATOR_PORT =~ ^[0-9]{1,6}$ ]];then
+  if nc -z -w5 localhost "$NIX_ANDROID_EMULATOR_PORT";then
+    echo "ERROR: port $NIX_ANDROID_EMULATOR_PORT taken, select different port or use automatic selection."
+    exit 1
+  fi
+elif [[ $NIX_ANDROID_EMULATOR_PORT == random ]];then
+  for i in $(seq 5554 2 5584)
+  do
+      if ! nc -z -w5 localhost "$i";then
+          NIX_ANDROID_EMULATOR_PORT=$i
+          break
+      fi
+  done
+  if [ "${NIX_ANDROID_EMULATOR_PORT}" == random ];then
+      echo "ERROR: Cannot assign emulator port, all ports taken."
+      exit 15
+  fi
+fi
+
+
+export ANDROID_SERIAL="emulator-$NIX_ANDROID_EMULATOR_PORT"
+echo "    ANDROID_SERIAL=$ANDROID_SERIAL"
+export AVDMANAGER_OPTS=$NIX_ANDROID_AVD_ARGS
+echo "    AVDMANAGER_OPTS=$AVDMANAGER_OPTS"
+
+"${ANDROID_SDK_ROOT}/tools/bin/avdmanager" list target
+
+
+echo "Creating android device..."
+if [[ "$("${ANDROID_SDK_ROOT}/tools/android" list avd | grep 'Name: device')" = "" ]];then
+  set +e
+    yes "" | "${ANDROID_SDK_ROOT}/tools/bin/avdmanager" create avd \
+      -n "$NIX_ANDROID_EMULATOR_DEVICE_NAME" \
+      -k "system-images;android-${NIX_ANDROID_EMULATOR_PLATFORM_VERSION};${NIX_ANDROID_EMULATOR_SYSTEM_IMAGE_TYPE};${NIX_ANDROID_EMULATOR_ABI_VERSION}" \
+      $NIX_ANDROID_AVD_ARGS
+  set -e
+fi
+
+
+echo "Launching emulator..."
+set +u
+  #-avd device \
+"${ANDROID_SDK_ROOT}/emulator/emulator" \
+  "@$NIX_ANDROID_EMULATOR_DEVICE_NAME" \
+  $NIX_ANDROID_EMULATOR_ARGS \
+  -port "$NIX_ANDROID_EMULATOR_PORT" &
+set -u
+
+echo "Waiting until the emulator has booted the device and the package manager is ready..."
+"$adb" -s $ANDROID_SERIAL wait-for-device
+echo "Device booting..."
+
+while [ -z "$(${adb} -s $ANDROID_SERIAL shell getprop dev.bootcomplete | grep 1)" ]
+do
+    sleep 1
+done
+echo "Device booted!"
+
+# ${sdk}/libexec/android-sdk/platform-tools/adb -s emulator-$port shell am start -a android.intent.action.MAIN -n ${package}/${activity}
+wait

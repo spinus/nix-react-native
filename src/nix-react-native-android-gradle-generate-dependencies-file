@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+set -Euo pipefail
+export SHELLOPTS
+
+# This script takes care of generating/updating the maven-sources.nix file
+# representing the offline Maven repo containing the dependencies
+# required to build the project
+msg(){
+  echo "$@" >&2
+}
+help(){
+  echo "Usage ${BASH_SOURCE%%*/} [...path/to/react-native-project/android]"
+  echo
+  echo " For defined 'android' inside react-native project, it:"
+  echo " - runs gradle to get dependencies for android project"
+  echo " - fetch dependencies and calculate checksums"
+  echo " - write output file with hardcoded/pinned dependencies into json file (similar to yarn.lock on JS side)"
+  echo " Output from that command, can be later used by nix-react-native tooling to build pinned dependencies environment."
+}
+
+if [[ -z "${1:-}" ]];then
+  help
+  exit 0
+fi
+
+export HERE=$(readlink -f "$(dirname "${BASH_SOURCE[0]}")")
+export REACT_NATIVE_ANDROID_PROJECT_PATH=${1?first argument must be path to react-native 'android' project folder}
+export REACT_NATIVE_ANDROID_PROJECT_PATH=$(readlink -f "${REACT_NATIVE_ANDROID_PROJECT_PATH}")
+
+if [[ -d "$REACT_NATIVE_ANDROID_PROJECT_PATH/app" ]] &&\
+   [[ -f "$REACT_NATIVE_ANDROID_PROJECT_PATH/build.gradle" ]] &&\
+   [[ -f "$REACT_NATIVE_ANDROID_PROJECT_PATH/gradle.properties" ]] &&\
+   [[ -f "$REACT_NATIVE_ANDROID_PROJECT_PATH/gradlew" ]];then
+  msg "REACT_NATIVE_ANDROID_PROJECT_PATH = $REACT_NATIVE_ANDROID_PROJECT_PATH"
+else
+  msg "ERROR: $REACT_NATIVE_ANDROID_PROJECT_PATH does not look like react native android project path"
+  exit 1
+fi
+
+
+PROJ_LIST_PATH=$(mktemp)
+DEPS_LIST_PATH=$(mktemp)
+DEPS_URLS_PATH=$(mktemp)
+DEPS_JSON_PATH="${REACT_NATIVE_ANDROID_PROJECT_PATH}/nix-react-native-gradle-dependencies.generated.json"
+GRADLE_CACHE_PATH="$REACT_NATIVE_ANDROID_PROJECT_PATH/app/build/intermediates/nix-react-native-gralde-cache"
+mkdir -p "$GRADLE_CACHE_PATH"
+
+# Raise limit of file descriptors
+ulimit -n 16384
+trap "rm -v '${PROJ_LIST_PATH}' '${DEPS_LIST_PATH}' '${DEPS_URLS_PATH}'" EXIT
+
+
+
+msg "[i] output will go $DEPS_JSON_PATH"
+
+gradle-get-dependencies(){
+  local DEPS
+  local BUILD_DEPS
+  local NORMAL_DEPS
+
+  DEPS=("${@}")
+  declare -a BUILD_DEPS
+  declare -a NORMAL_DEPS
+
+  msg "[i] getting gradle dependencies for ${@}..."
+
+  # Run the gradle command for a project:
+  # - ':buildEnvironment' to get build tools
+  # - ':dependencies' to get direct deps limited those by
+  #   implementation config to avoid test dependencies
+  for i in "${!DEPS[@]}"; do
+      BUILD_DEPS[${i}]="${DEPS[${i}]}:buildEnvironment"
+      NORMAL_DEPS[${i}]="${DEPS[${i}]}:dependencies"
+  done
+
+  # And clean up the output by:
+  # - keep only lines that start with \--- or +---
+  # - drop lines that end with (*) or (n) but don't start with (+)
+  # - drop lines that refer to a project
+  # - drop entries starting with `status-im:` like `status-go`
+  # - drop entries that aren't just the name of the dependency
+  # - extract the package name and version, ignoring version range indications,
+  #   such as in `com.google.android.gms:play-services-ads:[15.0.1,16.0.0) -> 15.0.1`
+  local DEPS
+
+  DEPS=$(set -x;gradle --no-daemon --console plain \
+      "${BUILD_DEPS[@]}" \
+      "${NORMAL_DEPS[@]}" \
+      androidDependencies \
+      |awk -f "$HERE/gradle_parser.awk")
+
+  msg "[i] gradle dependencies:"
+  for DEP in "${DEPS[@]}"
+  do
+    msg "[i] ${DEP}"
+  done
+  msg "[i] ---end---"
+
+  echo "$DEPS"
+}
+
+
+gradle-get-projects(){
+  msg "[i] getting project list from gradle..."
+  local LIST
+  local PROJ
+  LIST=$(gradle projects --no-daemon --console plain 2>&1 |
+      grep "Project ':" |
+      sed -E "s;^.--- Project '\:([@_a-zA-Z0-9\-]+)';\1;")
+  for PROJ in "${LIST[@]}"
+  do
+    echo "$PROJ"
+    msg "[i] $PROJ"
+  done
+  msg "[i] ---end---"
+}
+
+
+
+
+
+
+
+
+# Gradle needs to be run in 'android' subfolder
+cd "$REACT_NATIVE_ANDROID_PROJECT_PATH"
+
+# Stop gradle daemons to avoid locking
+msg "[-] making sure gradle is stopped..."
+gradle --stop >/dev/null
+msg "[+] gradle stopped."
+
+# Check each sub-project in parallel, the ":" is for local deps ---------------
+gradle-get-projects | sort -u -o "${PROJ_LIST_PATH}"
+msg "[+] Project list written to ${PROJ_LIST_PATH}."
+PROJECTS=$(<"${PROJ_LIST_PATH}")
+gradle-get-dependencies ":" ${PROJECTS[@]} | sort -uV -o "${DEPS_LIST_PATH}"
+msg "[+] Gradle dependencies list written to ${DEPS_LIST_PATH}."
+
+
+# Find download URLs for each dependency --------------------------------------
+# The AWK call removes duplicates using different repos.
+msg "[ ] running maven resolver to get dependencies URLs..."
+cat "${DEPS_LIST_PATH}"
+cat "${DEPS_LIST_PATH}" \
+    | egrep -v '^:' \
+    | go-maven-resolver \
+    | sort -uV -o "${DEPS_URLS_PATH}"
+msg "[+] dependencies URLs written to ${DEPS_URLS_PATH}"
+
+msg "[ ] fetching dependencies and calculating checksums..."
+
+export NIX_REACT_NATIVE_GRADLE_CACHE_PATH=$GRADLE_CACHE_PATH 
+cat "${DEPS_URLS_PATH}" | parallel --bar --will-cite --keep-order \
+    -P1 \
+    "${HERE}/nix-react-native-android-gradle-url2json" \
+    | jq -s > "${DEPS_JSON_PATH}.tmp"
+mv "${DEPS_JSON_PATH}.tmp" "${DEPS_JSON_PATH}"
